@@ -112,6 +112,37 @@
     governance-activity: uint 
   })
 
+;; Helper Functions
+(define-private (calculate-quadratic-voting-weight (amount uint) (conviction uint))
+  (let (
+    (base-weight (/ (* amount BASE-VOTING-WEIGHT) u1000000)) ;; Normalize amount
+    (conviction-bonus (/ (* conviction QUADRATIC-MULTIPLIER) u10000))
+    (total-weight (+ base-weight conviction-bonus))
+  )
+    ;; Apply quadratic formula: sqrt(weight) * multiplier
+    (/ (* (sqrti total-weight) u100) u10)))
+
+(define-private (calculate-dynamic-quorum (category uint))
+  (let (
+    (base (var-get base-quorum))
+  )
+    (if (is-eq category u1) ;; Treasury proposals need higher quorum
+      (+ base u10)
+      (if (is-eq category u2) ;; Governance proposals
+        (+ base u5)
+        base)))) ;; Protocol proposals use base quorum
+
+(define-private (update-conviction-score (user principal))
+  (let (
+    (current-stake (unwrap! (map-get? stakes { user: user }) ERR-STAKE-NOT-FOUND))
+    (blocks-passed (- block-height (get last-activity current-stake)))
+    (decay-factor (if (> blocks-passed u1440) ;; ~10 days
+      (var-get conviction-decay-rate)
+      u100))
+    (new-conviction (/ (* (get conviction-score current-stake) decay-factor) u100))
+  )
+    (ok new-conviction)))
+
 ;; Admin Functions
 (define-public (set-governance-token (new-token principal))
   (begin
@@ -130,6 +161,12 @@
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (asserts! (<= new-quorum u50) ERR-INVALID-AMOUNT) ;; Max 50%
     (var-set base-quorum new-quorum)
+    (ok true)))
+
+(define-public (fund-treasury (amount uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set treasury-balance (+ (var-get treasury-balance) amount))
     (ok true)))
 
 ;; Core Staking Functions
@@ -162,11 +199,29 @@
       (var-set total-staked (+ (var-get total-staked) amount))
       (ok new-conviction))))
 
+(define-public (unstake-tokens (amount uint))
+  (let (
+    (user-stake (unwrap! (map-get? stakes { user: tx-sender }) ERR-STAKE-NOT-FOUND))
+    (stake-end (+ (get start-block user-stake) (get duration user-stake)))
+  )
+    (asserts! (>= block-height stake-end) ERR-INVALID-DURATION)
+    (asserts! (>= (get amount user-stake) amount) ERR-INSUFFICIENT-STAKE)
+    
+    (let (
+      (updated-stake (merge user-stake { 
+        amount: (- (get amount user-stake) amount),
+        conviction-score: (/ (* (get conviction-score user-stake) (- (get amount user-stake) amount)) (get amount user-stake))
+      }))
+    )
+      (map-set stakes { user: tx-sender } updated-stake)
+      (var-set total-staked (- (var-get total-staked) amount))
+      (ok amount))))
+
 (define-public (create-proposal (title (string-ascii 100)) (description (string-ascii 500)) (category uint) (treasury-amount uint))
   (let (
     (proposal-id (var-get next-proposal-id))
     (user-stake (unwrap! (map-get? stakes { user: tx-sender }) ERR-STAKE-NOT-FOUND))
-    (voting-period u144) ;; ~1 day in blocks
+    (voting-period u1440) ;; ~10 days in blocks
     (dynamic-quorum (calculate-dynamic-quorum category))
   )
     (asserts! (var-get protocol-active) ERR-UNAUTHORIZED)
@@ -261,4 +316,72 @@
 
 (define-public (delegate-voting-power (delegate principal))
   (let (
-    (user-stake (unwrap! (map-get? stakes { user: tx-sender }) ERR-STAKE-NOT-
+    (user-stake (unwrap! (map-get? stakes { user: tx-sender }) ERR-STAKE-NOT-FOUND))
+    (delegated-weight (get conviction-score user-stake))
+  )
+    (asserts! (not (is-eq tx-sender delegate)) ERR-DELEGATION-FAILED)
+    (asserts! (> delegated-weight u0) ERR-INSUFFICIENT-STAKE)
+    
+    (map-set delegation-registry 
+      { delegator: tx-sender }
+      { 
+        delegate: delegate, 
+        delegated-weight: delegated-weight, 
+        active: true 
+      })
+    
+    (ok delegated-weight)))
+
+(define-public (revoke-delegation)
+  (begin
+    (asserts! (is-some (map-get? delegation-registry { delegator: tx-sender })) ERR-DELEGATION-FAILED)
+    
+    (map-delete delegation-registry { delegator: tx-sender })
+    (ok true)))
+
+;; Read-only Functions
+(define-read-only (get-stake (user principal))
+  (map-get? stakes { user: user }))
+
+(define-read-only (get-proposal (id uint))
+  (map-get? proposals { id: id }))
+
+(define-read-only (get-user-vote (proposal-id uint) (user principal))
+  (map-get? user-votes { proposal-id: proposal-id, user: user }))
+
+(define-read-only (get-treasury-balance)
+  (var-get treasury-balance))
+
+(define-read-only (get-total-staked)
+  (var-get total-staked))
+
+(define-read-only (get-protocol-status)
+  (var-get protocol-active))
+
+(define-read-only (get-delegation (delegator principal))
+  (map-get? delegation-registry { delegator: delegator }))
+
+(define-read-only (calculate-voting-power (user principal))
+  (let (
+    (user-stake (default-to 
+      { amount: u0, duration: u0, start-block: u0, conviction-score: u0, participation-count: u0, last-activity: u0 }
+      (map-get? stakes { user: user })))
+  )
+    (calculate-quadratic-voting-weight (get amount user-stake) (get conviction-score user-stake))))
+
+(define-read-only (get-proposal-status (proposal-id uint))
+  (let (
+    (proposal (map-get? proposals { id: proposal-id }))
+  )
+    (match proposal
+      prop {
+        proposal-id: proposal-id,
+        active: (and (<= block-height (get end-block prop)) (not (get executed prop))),
+        ended: (> block-height (get end-block prop)),
+        executed: (get executed prop),
+        winning: (> (get votes-for prop) (get votes-against prop))
+      }
+      { proposal-id: proposal-id, active: false, ended: false, executed: false, winning: false })))
+
+(define-read-only (get-next-proposal-id)
+  (var-get next-proposal-id))
